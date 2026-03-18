@@ -1,30 +1,61 @@
 ---
 name: wsl2-windows-chrome-cdp
-description: Guide for configuring OpenClaw (running in WSL2) to connect to a Windows Chrome browser instance via CDP (Chrome DevTools Protocol). Use this skill when troubleshooting or setting up browser automation across the WSL2-Windows network boundary, specifically addressing connection refused or DevToolsActivePort issues.
+description: Comprehensive guide for configuring OpenClaw (running in WSL2) to connect to a Windows Chrome browser instance via CDP (Chrome DevTools Protocol). Use this skill when troubleshooting or setting up cross-environment browser automation, specifically addressing "connection refused" errors, DevToolsActivePort issues, WSL2 networking quirks, and Windows Firewall configurations.
 ---
 
-# WSL2 to Windows Chrome CDP Configuration
+# WSL2 to Windows Chrome CDP Configuration Guide
 
-When OpenClaw runs inside WSL2 and needs to control Chrome running on the Windows host using the `existing-session` driver (CDP), you must bridge the virtual network gap between WSL2 and Windows.
+When OpenClaw runs inside WSL2 and needs to control Chrome running on the Windows host using the `existing-session` driver (CDP), you are crossing a virtual network boundary (NAT). By default, Chrome's debugging port only listens on `localhost` (127.0.0.1), making it completely invisible to WSL2.
 
-## 1. Launching Windows Chrome
+This guide details the exact steps to bridge this gap, verify the connection, and troubleshoot common pitfalls.
 
-By default, Chrome binds its debugging port only to `127.0.0.1` (localhost), which is unreachable from the WSL2 subnet. 
+## 1. Identify the Windows Host IP from WSL2
 
-Windows Chrome **must** be completely closed (ensure no background Chrome processes remain) and re-launched from the Windows Run prompt (Win+R) or Command Prompt with the following flags:
+WSL2 runs on its own virtual subnet. You cannot use `localhost` or `127.0.0.1` inside `openclaw.json` because that points back to the WSL2 Linux instance itself.
+
+**To find the host IP, run this in your WSL2 terminal:**
+```bash
+ip route show | grep -i default | awk '{ print $3}'
+```
+*(Alternatively, check the `nameserver` entry in `/etc/resolv.conf`).*
+
+Note this IP (e.g., `172.27.160.1`). You will need it later.
+
+## 2. Launch Windows Chrome (The Critical Step)
+
+Before proceeding, **ensure every single instance of Chrome is closed on Windows**. Check the system tray (bottom right) and kill any background Chrome tasks, or run this in Windows Command Prompt:
+```cmd
+taskkill /F /IM chrome.exe
+```
+
+Launch Chrome from the Windows Run prompt (`Win + R`) or Command Prompt using the following exact parameters:
 
 ```cmd
 chrome.exe --remote-debugging-port=9222 --remote-allow-origins=* --remote-debugging-address=0.0.0.0
 ```
 
-*Critical:* The `--remote-debugging-address=0.0.0.0` flag is what allows the port to be exposed to the WSL2 virtual network.
+### Why these flags?
+* `--remote-debugging-port=9222`: Opens the CDP port.
+* `--remote-allow-origins=*`: Bypasses CORS/origin checks. Without this, OpenClaw's websocket connection requests from a different IP will be rejected by Chrome.
+* `--remote-debugging-address=0.0.0.0`: **The most important flag.** It forces Chrome to listen on ALL network interfaces (including the virtual WSL switch) instead of just `127.0.0.1`.
 
-## 2. Configuring OpenClaw in WSL2
+## 3. Verify the Connection
 
-In your `openclaw.json` configuration file, the `cdpUrl` must point to the Windows host IP address from the perspective of WSL2, NOT `localhost` or `127.0.0.1`.
+Before configuring OpenClaw, prove that the connection works.
 
-1. Find the Windows host IP inside WSL2 (e.g., by checking `/etc/resolv.conf` nameserver or using `ip route`). It usually looks like `172.2x.x.x`.
-2. Update the browser configuration in `openclaw.json`:
+**From Windows (Host):**
+Open a browser and navigate to `http://localhost:9222/json/version`. You should see JSON output describing the Chrome version.
+
+**From WSL2 (Guest):**
+Run a curl command to the IP you found in Step 1:
+```bash
+curl -s http://<WSL2-host-IP>:9222/json/version
+```
+If you get a JSON response, the bridge is successfully established! If it hangs or says `Connection refused`, proceed to the Firewall Troubleshooting section.
+
+## 4. Configure OpenClaw
+
+Update your OpenClaw configuration file (`openclaw.json`) to use the host IP. 
 
 ```json
 {
@@ -35,7 +66,23 @@ In your `openclaw.json` configuration file, the `cdpUrl` must point to the Windo
 }
 ```
 
-## Troubleshooting
+## 5. Troubleshooting & Firewall Setup
 
-- **Connection Refused:** Ensure Windows Firewall is not blocking port 9222 on the vEthernet (WSL) network adapter.
-- **Still Cannot Connect:** Verify that you completely killed all existing Chrome processes before launching with the debugging flags. If a normal Chrome instance is already running, running the command will just open a new window in the existing process without enabling the debugging port.
+If the `curl` test in WSL2 fails, the Windows Defender Firewall is almost certainly blocking inbound connections on port 9222 from the WSL2 subnet.
+
+### Add a Firewall Rule in Windows:
+1. Open **Windows Defender Firewall with Advanced Security**.
+2. Click **Inbound Rules** -> **New Rule...**
+3. Rule Type: **Port** -> Next.
+4. Protocol and Ports: **TCP**, Specific local ports: **9222** -> Next.
+5. Action: **Allow the connection** -> Next.
+6. Profile: Check all (Domain, Private, Public) -> Next.
+7. Name: `Chrome CDP Debugging (WSL2)` -> Finish.
+
+### Double-check Listening Ports:
+If it still fails, confirm Chrome actually bound to `0.0.0.0`. Run this in Windows Command Prompt:
+```cmd
+netstat -ano | findstr 9222
+```
+You should see: `TCP    0.0.0.0:9222           0.0.0.0:0              LISTENING`
+If you see `127.0.0.1:9222`, a ghost Chrome process was still running when you tried to launch it with the flags. Kill all Chrome processes and try again.
